@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  bizz-backend:
+    build: .
+    ports:
+      - "18000:18000"
+    volumes:
+      - ./certs:/app/certs
+    environment:
+      SSL_KEYFILE: "/app/certs/key.pem"
+      SSL_CERTFILE: "/app/certs/cert.pem"
+
