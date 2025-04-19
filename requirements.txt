@@ -4,3 +4,7 @@ motor
 python-jose[cryptography]
 python-multipart
 python-dotenv
+httpx
+redis
+rq
+jwt

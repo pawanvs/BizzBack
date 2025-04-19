@@ -1,34 +1,42 @@
-# main.py - FastAPI server with HTTPS, MongoDB, and JWT Auth using environment configuration
+# main.py - FastAPI server with RQ-based webhook delivery, HTTPS, JWT Auth, and MongoDB
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 import motor.motor_asyncio
-import uvicorn
 import asyncio
 import os
-from dotenv import load_dotenv
+import uvicorn
+from redis import Redis
+from rq import Queue, Retry
+from webhook_worker import send_webhook
+from fastapi.responses import JSONResponse
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Configuration from environment
+# Configuration
+PORT = int(os.getenv("PORT", "18000"))
 SECRET_KEY = os.getenv("SECRET_KEY", "default_secret")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 MONGO_URI = os.getenv("MONGO_URI")
+SSL_KEYFILE = os.getenv("SSL_KEYFILE", "certs/key.pem")
+SSL_CERTFILE = os.getenv("SSL_CERTFILE", "certs/cert.pem")
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
 # MongoDB Client
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 db = client["bizzBackend"]
 users_collection = db["users"]
 
-# FastAPI App
+# FastAPI app
 app = FastAPI()
-
-# Auth Setup
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
 class Token(BaseModel):
@@ -38,9 +46,6 @@ class Token(BaseModel):
 class User(BaseModel):
     username: str
     password: str
-
-class UserInDB(User):
-    pass
 
 class CustomerInfo(BaseModel):
     purchaseOrder: str
@@ -66,16 +71,12 @@ async def get_user(username: str):
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=401,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+    credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
@@ -104,17 +105,19 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     access_token = create_access_token(data={"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
 
+@app.get("/api/status")
+def status():
+    return JSONResponse(content={"status": "ok", "service": "BizBack"})
+
 @app.get("/")
 async def root():
-    print("[LOG] GET / - Server is running")
     return {"message": "Server is running"}
 
 @app.get("/apiServerHealth")
 async def api_server_health():
-    print("[LOG] GET /apiServerHealth - Health check")
     return {"status": "healthy"}
 
-@app.post("/verifyCustomerInfo")
+@app.post("/verifyCustomerInfo2_simulation")
 async def verify_customer_info(payload: CustomerInfo, user: dict = Depends(get_current_user)):
     print(f"[LOG] POST /verifyCustomerInfo - Received payload: {payload.dict()}")
     await asyncio.sleep(10)
@@ -146,8 +149,61 @@ async def verify_customer_info(payload: CustomerInfo, user: dict = Depends(get_c
     print(f"[LOG] POST /verifyCustomerInfo - Responding with static response")
     return response
 
+async def process_verification_request(data):
+    verification_id = data.get("verificationId")
+    print(f"[LOG] 🚀 Simulating verification call: {verification_id}")
+
+    await asyncio.sleep(10)
+
+    result = {
+        "verificationId": verification_id,
+        "Customer Name": data.get("customerName"),
+        "Company": data.get("company", "ABC Towing"),
+        "Call Outcome": "Confirmed service",
+        "PurchaseOrder": data.get("purchaseOrder"),
+        "outBoundCallNumber": data.get("customerPhone"),
+        "callDurationMin": 94,
+        "userSentiment": "Positive",
+        "disconnectReason": "agent_hangup",
+        "response": "SUCCESS",
+        "Reason": data.get("reason"),
+        "CallScore": "60",
+        "CallScoreReview": "Positive",
+        "transcript": "Agent: Hi ... User: Yes ... Agent: Great!",
+        "gdslt": verification_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "webhookUrl": data.get("webhookUrl")
+    }
+
+    redis_conn = Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        password=REDIS_PASSWORD
+    )
+    q = Queue("webhookQueue", connection=redis_conn, serializer=PickleSerializer)
+    q.enqueue(send_webhook, result,
+        retry=Retry(max=3, interval=[5, 10, 30])
+        )
+    print("[LOG] 📤 Enqueued webhook job with retry")
+
+@app.post("/verifyCustomerInfo")
+async def verify_customer_info(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user)
+):
+    data = await request.json()
+    print(f"[LOG] POST /verifyCustomerInfo - Received payload: {data}")
+    background_tasks.add_task(process_verification_request, data)
+    return {"status": "queued", "verificationId": data.get("verificationId")}
+
 if __name__ == "__main__":
-    print("[LOG] Starting Biz FastAPI server on HTTPS port 18000...")
-    ssl_keyfile = os.getenv("SSL_KEYFILE", "certs/key.pem")
-    ssl_certfile = os.getenv("SSL_CERTFILE", "certs/cert.pem")
-    uvicorn.run("main:app", host="0.0.0.0", port=18000, ssl_keyfile=ssl_keyfile, ssl_certfile=ssl_certfile)
+    print(f"[LOG] Starting FastAPI server on HTTPS port {PORT}...")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=PORT,
+        ssl_keyfile=SSL_KEYFILE,
+        ssl_certfile=SSL_CERTFILE
+    )
+    
